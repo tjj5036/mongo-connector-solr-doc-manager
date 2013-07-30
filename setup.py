@@ -10,7 +10,7 @@ setup(name='mongo-connector-solr-doc-manager',
       author_email='tyler.jones@10gen.com',
       url='https://github.com/10gen-labs/',
       py_modules=['solr_doc_manager'],
-      install_requires=['pysolr'],
+      install_requires=['pysolr >= 3.1.0'],
       license='OSI Approved :: Apache Software License',
       keywords='mongo-connector',
       entry_points={

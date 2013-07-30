@@ -23,49 +23,16 @@ is that this file can be used as an example to add on different backends.
 To extend this to other systems, simply implement the exact same class and
 replace the method definitions with API calls for the desired backend.
 """
+import re
+import json
 import logging
-import sys
-import time
 
-from pysolr import Solr
+from pysolr import Solr, SolrError
 from threading import Timer
-from urllib2 import urlopen, URLError
+from mongo_connector.util import verify_url, retry_until_ok
+ADMIN_URL = 'admin/luke?show=Schema&wt=json'
 
-def verify_url(url):
-    """Verifies the validity of a given url.
-    """
-    try:
-        urlopen(url)
-        return True
-    except (ValueError, URLError):
-        return False
-
-def retry_until_ok(func, args=None):
-    """Retry code block until it succeeds.
-
-    If it does not succeed in 60 attempts, the
-    function simply exits.
-    """
-
-    result = True
-    count = 0
-    while True:
-        try:
-            if args is None:
-                result = func()
-                break
-            else:
-                result = func(args)
-                break
-        except:
-            count += 1
-            if count > 60:
-                logging.error('Call to %s failed too many times'
-                ' in retry_until_ok' % (func))
-                sys.exit(1)
-            time.sleep(1)
-
-    return result
+decoder = json.JSONDecoder()
 
 class DocManager():
     """The DocManager class creates a connection to the backend engine and
@@ -76,7 +43,7 @@ class DocManager():
     multiple, slightly different versions of a doc.
     """
 
-    def __init__(self, url, auto_commit=True, unique_key='_id'):
+    def __init__(self, url, auto_commit=False, unique_key='_id'):
         """Verify Solr URL and establish a connection.
         """
         if verify_url(url) is False:
@@ -85,9 +52,57 @@ class DocManager():
         self.solr = Solr(url)
         self.unique_key = unique_key
         self.auto_commit = auto_commit
+        self.field_list = []
+        self.dynamic_field_list = []
+        self.build_fields()
 
         if auto_commit:
             self.run_auto_commit()
+
+    def _parse_fields(self, result, field_name):
+        """ If Schema access, parse fields and build respective lists
+        """
+        field_list = []
+        for key, value in result.get('schema', {}).get(field_name, {}).items():
+            if key not in field_list:
+                field_list.append(key)
+        return field_list    
+
+    def build_fields(self):
+        """ Builds a list of valid fields
+        """
+        try:
+            declared_fields = self.solr._send_request('get', ADMIN_URL)
+        except SolrError:
+            pass
+        result = decoder.decode(declared_fields)
+        self.field_list = self._parse_fields(result, 'fields'),
+        self.dynamic_field_list = self._parse_fields(result, 'dynamicFields')
+
+    def clean_doc(self, doc):
+        """ Cleans a document passed in to be compliant with the Solr as
+        used by Solr. This WILL remove fields that aren't in the schema, so
+        the document may actually get altered.
+        """
+        if not self.field_list:
+            return doc
+
+        fixed_doc = {}
+        for key, value in doc.items():
+            if key in self.field_list[0]:
+                fixed_doc[key] = value
+
+            # Dynamic strings. * can occur only at beginning and at end
+            else:
+                for field in self.dynamic_field_list:
+                    if field[0] == '*':
+                        regex = re.compile(r'\w%s\b' % (field))
+                    else:
+                        regex = re.compile(r'\b%s\w' % (field))
+                    if regex.match(key):
+                        fixed_doc[key] = value
+
+        return fixed_doc        
 
     def stop(self):
         """ Stops the instance
@@ -101,14 +116,22 @@ class DocManager():
         the backend engine and add the document in there. The input will
         always be one mongo document, represented as a Python dictionary.
         """
-        self.solr.add([doc], commit=False)
+        try:
+            self.solr.add([self.clean_doc(doc)], commit=True)
+        except SolrError:
+            logging.error("Could not insert %r into Solr" % (doc,))
 
     def remove(self, doc):
         """Removes documents from Solr
 
         The input is a python dictionary that represents a mongo document.
         """
-        self.solr.delete(id=str(doc[self.unique_key]), commit=False)
+        self.solr.delete(id=str(doc[self.unique_key]), commit=True)
+
+    def _remove(self):
+        """Removes everything
+        """
+        self.solr.delete(q='*:*')
 
     def search(self, start_ts, end_ts):
         """Called to query Solr for documents in a time range.
@@ -138,8 +161,10 @@ class DocManager():
         """Returns the last document stored in the Solr engine.
         """
         #search everything, sort by descending timestamp, return 1 row
-        result = self.solr.search('*:*', sort='_ts desc', rows=1
-                                  )
+        try:
+            result = self.solr.search('*:*', sort='_ts desc', rows=1)
+        except ValueError:
+            return None
 
         if len(result) == 0:
             return None
